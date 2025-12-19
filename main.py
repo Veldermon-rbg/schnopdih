@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# schnopdih v5 — bookmarks toolbar, webstore interception/help page, working side dialogs,
-# clearer extension instructions. Keeps light (black-on-white) theme.
-# Save as schnopdih_v5.py and run: python schnopdih_v5.py
+# schnopdih v6 — fixes: added missing _safe_call, persistent dialogs so Bookmarks/History/Downloads don't vanish,
+# plus small robustness tweaks. Light theme retained.
+# Save as schnopdih_v6.py and run: python schnopdih_v6.py
 
 import os
 import sys
@@ -25,9 +25,8 @@ from PyQt5.QtCore import (
     QPropertyAnimation,
     QEasingCurve,
     pyqtSignal,
-    QPoint,
 )
-from PyQt5.QtGui import QColor, QPalette, QKeySequence, QIcon, QCursor
+from PyQt5.QtGui import QColor, QPalette, QKeySequence
 from PyQt5.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -40,21 +39,16 @@ from PyQt5.QtWidgets import (
     QTabWidget,
     QPushButton,
     QFileDialog,
-    QMessageBox,
     QListWidget,
     QListWidgetItem,
     QMenu,
     QStyle,
     QLabel,
     QSizePolicy,
-    QProgressBar,
     QShortcut,
-    QInputDialog,
     QDialog,
     QFormLayout,
-    QCheckBox,
     QTextEdit,
-    QSplitter,
     QComboBox,
 )
 from PyQt5.QtWebEngineWidgets import (
@@ -474,6 +468,9 @@ class SchnopdihWindow(QMainWindow):
         self.closed_tabs_stack: List[str] = []
         self.current_theme_css = PLAIN_WHITE_CSS
 
+        # keep references to any open dialogs so they don't vanish
+        self._open_dialogs: List[QWidget] = []
+
         # profile
         self.profile = QWebEngineProfile.defaultProfile()
         try:
@@ -520,6 +517,22 @@ class SchnopdihWindow(QMainWindow):
 
         # load extension-like JS files
         self._load_enabled_extensions()
+
+    # small helper used widely to avoid repetitive try/except
+    def _safe_call(self, fn):
+        try:
+            return fn()
+        except Exception:
+            return None
+
+    def _track_dialog(self, dlg: QWidget):
+        # keep a strong reference so Python GC doesn't close the widget
+        try:
+            self._open_dialogs.append(dlg)
+            dlg.setAttribute(Qt.WA_DeleteOnClose)
+            dlg.destroyed.connect(lambda _: self._open_dialogs.remove(dlg) if dlg in self._open_dialogs else None)
+        except Exception:
+            pass
 
     def _build_ui(self):
         root = QWidget(self)
@@ -661,6 +674,7 @@ class SchnopdihWindow(QMainWindow):
         menu.addAction("Bookmarks", lambda: self._show_bookmarks())
         menu.addAction("History", lambda: self._show_history())
         menu.addAction("Downloads", lambda: self._show_downloads())
+        # exec_ keeps it modal so it shouldn't disappear immediately
         menu.exec_(self.btn_menu.mapToGlobal(self.btn_menu.rect().bottomLeft()))
 
     def add_tab(self, url: str = DEFAULT_HOMEPAGE, switch: bool = False, private: bool = False):
@@ -1007,6 +1021,7 @@ class SchnopdihWindow(QMainWindow):
         dlg.itemDoubleClicked.connect(lambda it: self.add_tab(it.data(Qt.UserRole), switch=True))
         dlg.resize(600, 400)
         dlg.show()
+        self._track_dialog(dlg)
 
     def _show_history(self):
         dlg = QListWidget()
@@ -1018,6 +1033,7 @@ class SchnopdihWindow(QMainWindow):
         dlg.itemDoubleClicked.connect(lambda it: self.add_tab(it.data(Qt.UserRole), switch=True))
         dlg.resize(700, 420)
         dlg.show()
+        self._track_dialog(dlg)
 
     def _show_downloads(self):
         dlg = QListWidget()
@@ -1036,6 +1052,7 @@ class SchnopdihWindow(QMainWindow):
         timer.start()
         dlg.resize(560, 300)
         dlg.show()
+        self._track_dialog(dlg)
 
     def _show_reading_list(self):
         path = DATA_DIR / "reading_list.json"
@@ -1049,6 +1066,7 @@ class SchnopdihWindow(QMainWindow):
         dlg.itemDoubleClicked.connect(lambda it: self.add_tab(it.data(Qt.UserRole), switch=True))
         dlg.resize(640, 380)
         dlg.show()
+        self._track_dialog(dlg)
 
     # other conveniences
     def _toggle_fullscreen(self):
