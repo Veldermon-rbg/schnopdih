@@ -500,15 +500,23 @@ class SchnopdihWindow(QMainWindow):
             pass
 
         # hotkeys
-        QShortcut(QKeySequence("Ctrl+T"), self, activated=lambda: self.add_tab(DEFAULT_HOMEPAGE, switch=True))
-        QShortcut(QKeySequence("Ctrl+W"), self, activated=lambda: self._safe_call(lambda: self._close_tab(self.tabs.currentIndex())))
-        QShortcut(QKeySequence("Ctrl+L"), self, activated=lambda: self._safe_call(lambda: self.urlbar.setFocus()))
-        QShortcut(QKeySequence("F11"), self, activated=self._toggle_fullscreen)
-        QShortcut(QKeySequence("Ctrl+Shift+T"), self, activated=self._reopen_closed_tab)
-        QShortcut(QKeySequence("Ctrl+R"), self, activated=lambda: self._safe_call(lambda: self._current_view().reload()))
+        sc1 = QShortcut(QKeySequence("Ctrl+T"), self)
+        sc1.activated.connect(lambda: self.add_tab(DEFAULT_HOMEPAGE, switch=True))
+        sc2 = QShortcut(QKeySequence("Ctrl+W"), self)
+        sc2.activated.connect(lambda: self._safe_call(lambda: self._close_tab(self.tabs.currentIndex())))
+        sc3 = QShortcut(QKeySequence("Ctrl+L"), self)
+        sc3.activated.connect(lambda: self._safe_call(lambda: self.urlbar.setFocus()))
+        sc4 = QShortcut(QKeySequence("F11"), self)
+        sc4.activated.connect(self._toggle_fullscreen)
+        sc5 = QShortcut(QKeySequence("Ctrl+Shift+T"), self)
+        sc5.activated.connect(self._reopen_closed_tab)
+        sc6 = QShortcut(QKeySequence("Ctrl+R"), self)
+        sc6.activated.connect(lambda: self._safe_call(lambda: self._current_view().reload()))
         # tab cycling
-        QShortcut(QKeySequence("Ctrl+Tab"), self, activated=self._next_tab)
-        QShortcut(QKeySequence("Ctrl+Shift+Tab"), self, activated=self._prev_tab)
+        sc7 = QShortcut(QKeySequence("Ctrl+Tab"), self)
+        sc7.activated.connect(self._next_tab)
+        sc8 = QShortcut(QKeySequence("Ctrl+Shift+Tab"), self)
+        sc8.activated.connect(self._prev_tab)
 
     def add_tab(self, url: str = DEFAULT_HOMEPAGE, switch: bool = False, private: bool = False):
         if private:
