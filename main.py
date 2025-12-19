@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# schnopdih v4 — light-mode default (black text on white background), improved extension instructions,
-# and Google forced to full desktop version via modern User-Agent.
-# Save as schnopdih_v4.py and run: python schnopdih_v4.py
+# schnopdih v5 — bookmarks toolbar, webstore interception/help page, working side dialogs,
+# clearer extension instructions. Keeps light (black-on-white) theme.
+# Save as schnopdih_v5.py and run: python schnopdih_v5.py
 
 import os
 import sys
@@ -84,7 +84,6 @@ STORAGE_DIR = DATA_DIR / "storage"
 CACHE_DIR.mkdir(exist_ok=True)
 STORAGE_DIR.mkdir(exist_ok=True)
 
-# default homepage remains Google
 DEFAULT_HOMEPAGE = "https://www.google.com/"
 DEFAULT_WINDOW_SIZE = (1280, 820)
 
@@ -481,7 +480,6 @@ class SchnopdihWindow(QMainWindow):
             self.profile.setCachePath(str(CACHE_DIR))
             self.profile.setPersistentStoragePath(str(STORAGE_DIR))
             self.profile.setHttpCacheMaximumSize(300 * 1024 * 1024)
-            # force modern user agent so Google serves the full desktop UI
             try:
                 self.profile.setHttpUserAgent(MODERN_USER_AGENT)
             except Exception:
@@ -533,7 +531,7 @@ class SchnopdihWindow(QMainWindow):
         self.titlebar = TitleBar(self)
         root_layout.addWidget(self.titlebar)
 
-        # toolbar (minimal per request)
+        # toolbar
         self.toolbar = QToolBar("Navigation")
         self.toolbar.setMovable(False)
         self.toolbar.setIconSize(QSize(18, 18))
@@ -556,6 +554,14 @@ class SchnopdihWindow(QMainWindow):
         self.toolbar.addWidget(self.btn_menu)
 
         root_layout.addWidget(self.toolbar)
+
+        # bookmarks toolbar (new) — horizontal small buttons
+        self.bookmarks_toolbar = QWidget()
+        b_layout = QHBoxLayout(self.bookmarks_toolbar)
+        b_layout.setContentsMargins(6, 4, 6, 4)
+        b_layout.setSpacing(6)
+        root_layout.addWidget(self.bookmarks_toolbar)
+        self.refresh_bookmarks_toolbar()
 
         # tabs
         self.tabs = QTabWidget()
@@ -591,6 +597,34 @@ class SchnopdihWindow(QMainWindow):
 
         # initial tab
         self.add_tab(DEFAULT_HOMEPAGE, switch=True)
+
+    def refresh_bookmarks_toolbar(self):
+        try:
+            layout = self.bookmarks_toolbar.layout()
+            # clear existing
+            while layout.count():
+                item = layout.takeAt(0)
+                if item and item.widget():
+                    item.widget().deleteLater()
+            # add up to 8 bookmarks
+            for b in self.bookmarks.all()[:8]:
+                title = (b.get('title') or b.get('url'))
+                btn = QPushButton(title)
+                btn.setStyleSheet('background:#fff;border:1px solid #e6e6e6;padding:4px 8px;border-radius:6px;color:#000;')
+                btn.setFixedHeight(26)
+                btn.clicked.connect(lambda checked, url=b.get('url'): self.add_tab(url, switch=True))
+                layout.addWidget(btn)
+            # spacer and add current button
+            spacer = QWidget()
+            spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+            layout.addWidget(spacer)
+            add_btn = QPushButton('+')
+            add_btn.setFixedSize(26, 26)
+            add_btn.clicked.connect(self._bookmark_current)
+            add_btn.setToolTip('Add current page to bookmarks')
+            layout.addWidget(add_btn)
+        except Exception:
+            pass
 
     def _connect_signals(self):
         self.act_back.triggered.connect(lambda: self._safe_call(lambda: self._current_view().back()))
@@ -650,9 +684,10 @@ class SchnopdihWindow(QMainWindow):
         idx = self.tabs.addTab(view, "New")
         if switch:
             self.tabs.setCurrentIndex(idx)
-        view.load(QUrl(url))
+        # connect signals
         view.titleChanged.connect(lambda t, v=view: self._update_tab_title(v, t))
         view.urlChanged.connect(lambda u, v=view: self._update_urlbar(v, u))
+        view.urlChanged.connect(lambda u, v=view: self._on_view_url_changed(v, u))
         view.loadFinished.connect(lambda ok, v=view: self._on_load_finished(ok, v))
         try:
             view.loadProgress.connect(lambda p, v=view: self._on_load_progress(p, v))
@@ -667,6 +702,54 @@ class SchnopdihWindow(QMainWindow):
         if isinstance(w, SchnopdihWebView):
             return w
         return None
+
+    def _on_view_url_changed(self, view: SchnopdihWebView, qurl: QUrl):
+        # intercept Chrome webstore and chrome:// pages — show help instead (QtWebEngine doesn't support these)
+        try:
+            url = qurl.toString()
+            lower = url.lower()
+            if 'chrome.google.com/webstore' in lower or lower.startswith('chrome://') or 'chrome://extensions' in lower:
+                help_html = self._chrome_webstore_help_html()
+                # load help HTML into the view (prevents the broken store from trying to run)
+                view.setHtml(help_html, QUrl('about:blank'))
+                show_toast(self, 'Chrome Web Store is not supported directly — opened help')
+                return
+        except Exception:
+            pass
+
+    def _chrome_webstore_help_html(self):
+        return """
+<!doctype html>
+<html>
+<head><meta charset='utf-8'><title>Chrome Web Store — Not Supported</title></head>
+<body style='font-family:Segoe UI,Arial; padding:20px; background:#fff; color:#000'>
+<h2>Chrome Web Store is not supported directly in this app</h2>
+<p>QtWebEngine does not provide the Chromium Extensions APIs required to install and run Chrome Web Store extensions.</p>
+<h3>Two practical alternatives</h3>
+<ul>
+<li><strong>Install unpacked content scripts</strong>: If an extension only injects content scripts (JS that manipulates pages), you can extract those files from the extension and install them as a schnopdih "script": <em>Settings → Extensions → Install Script</em>.</li>
+<li><strong>Use a Chromium-based browser</strong> (Chrome, Edge) for extensions that need full extension APIs (background pages, chrome.runtime, webRequest, etc.).</li>
+</ul>
+<h3>Quick extract guide</h3>
+<ol>
+<li>In Chrome, enable Developer Mode on <code>chrome://extensions</code> and find the extension folder on disk (or locate it under your Chrome profile's Extensions directory).</li>
+<li>Copy the extension's folder to your machine. Look for <code>manifest.json</code> and files listed under <code>content_scripts</code>.</li>
+<li>Find the JS files listed under content_scripts. Those files are the scripts you can try to run as user-scripts in schnopdih.</li>
+<li>In schnopdih: Settings → Extensions → Install Script -> choose the JS file.</li>
+<li>If the script references <code>chrome.*</code> APIs, you'll need to port or remove those calls.</li>
+</ol>
+<p>If you want, paste the extension ID or path and I can help extract/adapt content scripts for you.</p>
+</body>
+</html>
+"""
+
+    def _on_tab_changed(self, index: int):
+        v = self._current_view()
+        if v:
+            try:
+                self._update_urlbar(v, v.url())
+            except Exception:
+                pass
 
     def _close_tab(self, index: int):
         if index < 0 or index >= self.tabs.count():
@@ -795,6 +878,8 @@ class SchnopdihWindow(QMainWindow):
             self.history.add(title, view.url().toString())
             self._update_tab_title(view, title)
             self.status.setText(title)
+            # refresh bookmarks toolbar in case bookmarks changed externally
+            QTimer.singleShot(200, self.refresh_bookmarks_toolbar)
         except Exception:
             pass
 
@@ -816,6 +901,7 @@ class SchnopdihWindow(QMainWindow):
         title = v.title() or url
         self.bookmarks.add(title, url)
         show_toast(self, "Bookmark saved")
+        self.refresh_bookmarks_toolbar()
 
     def _on_download_requested(self, item):
         try:
@@ -881,73 +967,36 @@ class SchnopdihWindow(QMainWindow):
         except Exception:
             pass
 
-    def _duplicate_tab(self):
-        v = self._current_view()
-        if not v:
-            return
-        url = v.url().toString()
-        self.add_tab(url, switch=True)
-
-    def _toggle_mute_current(self):
-        v = self._current_view()
-        if not v:
-            return
+    # Extension loading
+    def _load_enabled_extensions(self):
+        self.extensions = []
         try:
-            p = v.page()
-            current = False
-            try:
-                current = p.isAudioMuted()
-            except Exception:
+            for d in EXTENSIONS_DIR.iterdir():
+                if d.is_dir():
+                    m = d / 'manifest.json'
+                    script = d / 'content.js'
+                    if m.exists() and script.exists():
+                        data = _load_json(m, None)
+                        enabled = data.get('enabled', True) if isinstance(data, dict) else True
+                        self.extensions.append({'dir': d, 'meta': data, 'script': str(script), 'enabled': enabled})
+        except Exception:
+            pass
+
+    def _inject_extensions_into_view(self, view: SchnopdihWebView):
+        try:
+            for ext in getattr(self, 'extensions', []):
+                if not ext.get('enabled'):
+                    continue
                 try:
-                    current = getattr(p, "_schnopdih_muted", False)
-                except Exception:
-                    current = False
-            new = not current
-            try:
-                p.setAudioMuted(new)
-            except Exception:
-                try:
-                    setattr(p, "_schnopdih_muted", new)
+                    with open(ext.get('script'), 'r', encoding='utf-8') as f:
+                        js = f.read()
+                    view.page().runJavaScript(js)
                 except Exception:
                     pass
-            show_toast(self, "Muted" if new else "Unmuted")
         except Exception:
             pass
 
-    def add_current_to_reading_list(self):
-        v = self._current_view()
-        if not v:
-            return
-        path = DATA_DIR / "reading_list.json"
-        items = _load_json(path, []) or []
-        url = v.url().toString()
-        title = v.title() or url
-        if any(i.get('url') == url for i in items):
-            show_toast(self, "Already in reading list")
-            return
-        items.insert(0, {"title": title, "url": url, "added": _now_iso()})
-        _save_json(path, items)
-        show_toast(self, "Added to reading list")
-
-    def _safe_call(self, fn):
-        try:
-            fn()
-        except Exception:
-            pass
-
-    def _on_tab_changed(self, index: int):
-        v = self._current_view()
-        if v:
-            self._update_urlbar(v, v.url())
-
-    def closeEvent(self, event):
-        try:
-            self._save_session()
-        except Exception:
-            pass
-        super().closeEvent(event)
-
-    # Quick dialogs / utilities
+    # UI dialogs
     def _show_bookmarks(self):
         dlg = QListWidget()
         dlg.setWindowTitle("Bookmarks")
@@ -973,10 +1022,18 @@ class SchnopdihWindow(QMainWindow):
     def _show_downloads(self):
         dlg = QListWidget()
         dlg.setWindowTitle("Downloads")
-        for dr in self.downloads.active:
-            label = f"{Path(dr.dest).name} — {dr.progress}%{' (done)' if dr.finished else ''}"
-            it = QListWidgetItem(label)
-            dlg.addItem(it)
+        # small refresh timer to update progress
+        def refresh():
+            dlg.clear()
+            for dr in self.downloads.active:
+                label = f"{Path(dr.dest).name} — {dr.progress}%{' (done)' if dr.finished else ''}"
+                it = QListWidgetItem(label)
+                dlg.addItem(it)
+        refresh()
+        timer = QTimer(dlg)
+        timer.setInterval(500)
+        timer.timeout.connect(refresh)
+        timer.start()
         dlg.resize(560, 300)
         dlg.show()
 
@@ -1040,37 +1097,6 @@ class SchnopdihWindow(QMainWindow):
         except Exception:
             QLineEdit.keyPressEvent(self.urlbar, event)
 
-    # -------------------------
-    # extension-like user-scripts support
-    # -------------------------
-    def _load_enabled_extensions(self):
-        self.extensions = []
-        try:
-            for d in EXTENSIONS_DIR.iterdir():
-                if d.is_dir():
-                    m = d / 'manifest.json'
-                    script = d / 'content.js'
-                    if m.exists() and script.exists():
-                        data = _load_json(m, None)
-                        enabled = data.get('enabled', True) if isinstance(data, dict) else True
-                        self.extensions.append({'dir': d, 'meta': data, 'script': str(script), 'enabled': enabled})
-        except Exception:
-            pass
-
-    def _inject_extensions_into_view(self, view: SchnopdihWebView):
-        try:
-            for ext in getattr(self, 'extensions', []):
-                if not ext.get('enabled'):
-                    continue
-                try:
-                    with open(ext.get('script'), 'r', encoding='utf-8') as f:
-                        js = f.read()
-                    view.page().runJavaScript(js)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
 # -------------------------
 # Settings dialog (General / Privacy / Extensions with instructions)
 # -------------------------
@@ -1109,7 +1135,6 @@ class SettingsDialog(QDialog):
         choice = self.theme_select.currentText()
         self.parent.current_theme_css = PLAIN_WHITE_CSS if choice.startswith('Plain White') else self.parent.current_theme_css
         if choice == 'Soft Dark':
-            # fallback soft dark for users who pick it
             self.parent.current_theme_css = "body{background:#0b1420;color:#e6eef8;}"
         for i in range(self.parent.tabs.count()):
             w = self.parent.tabs.widget(i)
@@ -1181,17 +1206,16 @@ inject CSS can be converted to a user-script and installed in schnopdih.
 Steps to get a useful script from a Chrome extension (high level):
 1. In Chrome, go to chrome://extensions, enable Developer mode.
 2. Install the extension from the Chrome Web Store.
-3. In chrome://extensions click "Details" for the installed extension and click "View in Chrome Web Store" then note the extension ID,
-   or locate the extension folder under your Chrome profile's Extensions directory.
-4. Copy the extension's folder (the one that contains manifest.json) to your machine. Look for content scripts in the manifest ("content_scripts").
+3. In chrome://extensions click "Details" and note the extension folder on disk (or locate it under your Chrome profile's Extensions directory).
+4. Copy the extension's folder to your machine. Look for content scripts in the manifest ("content_scripts").
 5. Find the JS files listed under content_scripts. Those files are the scripts you can try to run as user-scripts in schnopdih.
-6. In schnopdih: Settings → Extensions → Install Script -> choose the content script JS file.
+6. In schnopdih: Settings → Extensions → Install Script -> choose the JS file.
 7. If the extension depends on extension APIs (chrome.runtime, messaging, background pages), it won't work as-is. You may be able to
    port the logic to a standalone content script (remove chrome.* calls) or implement small shims, but that's manual work.
 
 Alternative: For features you cannot port, use a Chromium-based browser (Chrome, Edge) which fully supports Chrome Web Store extensions.
 
-This instructions box is a concise guide. If you want, I can help extract a specific extension's content scripts and adapt them into a schnopdih user-script.
+If you want, paste the extension ID or path and I can help extract/adapt content scripts for you.
 """
         )
         layout.addWidget(instr)
