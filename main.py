@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 # schnopdih v2 — single-file aesthetic Chromium browser (Windows 10/11 friendly)
-# Feature-rich, more user-friendly, better error handling, working hotkeys, tab + button,
-# omnibox suggestions from bookmarks/history, reopen closed tabs, status/progress bar,
-# dark/light theme toggle, fullscreen (F11), focus omnibox (Ctrl+L), close tab (Ctrl+W),
-# reopen closed tab (Ctrl+Shift+T), cycle tabs Ctrl+Tab / Ctrl+Shift+Tab.
+# Updated: fixes omnibox freeze (debounced suggestions), gentler default theme,
+# default homepage set to Google, and other quality-of-life improvements.
 # Save as schnopdih_v2.py and run: python schnopdih_v2.py
 
 import os
@@ -78,21 +76,23 @@ STORAGE_DIR = DATA_DIR / "storage"
 CACHE_DIR.mkdir(exist_ok=True)
 STORAGE_DIR.mkdir(exist_ok=True)
 
-DEFAULT_HOMEPAGE = "https://duckduckgo.com/"
+# make Google the default homepage per request
+DEFAULT_HOMEPAGE = "https://www.google.com/"
 DEFAULT_WINDOW_SIZE = (1280, 820)
+
+# a gentler, softer dark theme for less eye strain
+SOFT_DARK_THEME_CSS = """
+body{background:#0b1420 !important;color:#e6eef8 !important;font-family:-apple-system,Segoe UI,Roboto,Arial}
+a{color:#63b3ff !important}
+img{max-width:100%;border-radius:6px}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-thumb{background:rgba(200,200,200,0.08);border-radius:10px}
+"""
 
 LIGHT_THEME_CSS = """
 body{background:#f6f8fb !important;color:#0b1b2b !important;font-family:-apple-system,Segoe UI,Roboto,Arial}
 a{color:#0b84ff !important}
 img{max-width:100%;border-radius:6px}
-"""
-
-DARK_THEME_CSS = """
-body{background:#061221 !important;color:#dfeaf6 !important;font-family:-apple-system,Segoe UI,Roboto,Arial}
-a{color:#7dd3fc !important}
-img{max-width:100%;border-radius:8px}
-::-webkit-scrollbar{width:10px;height:10px}
-::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.06);border-radius:10px}
 """
 
 # -------------------------
@@ -206,7 +206,6 @@ class DownloadManager:
         dr = DownloadRecord(item, dest)
         self.active.append(dr)
         try:
-            # WebEngineDownloadItem API varies by version; best-effort wiring
             item.setPath(dest)
             item.accept()
             try:
@@ -267,7 +266,7 @@ class SimpleRequestInterceptor(QWebEngineUrlRequestInterceptor):
 class SchnopdihWebView(QWebEngineView):
     titleChanged = pyqtSignal(str)
 
-    def __init__(self, profile: Optional[QWebEngineProfile] = None, theme_css: str = DARK_THEME_CSS):
+    def __init__(self, profile: Optional[QWebEngineProfile] = None, theme_css: str = SOFT_DARK_THEME_CSS):
         super().__init__()
         if profile is not None:
             try:
@@ -348,7 +347,7 @@ class SchnopdihWindow(QMainWindow):
         self.downloads = DownloadManager()
         self.session = SessionManager()
         self.closed_tabs_stack: List[str] = []
-        self.current_theme_css = DARK_THEME_CSS
+        self.current_theme_css = SOFT_DARK_THEME_CSS
 
         # profile
         self.profile = QWebEngineProfile.defaultProfile()
@@ -371,6 +370,13 @@ class SchnopdihWindow(QMainWindow):
         # UI
         self._build_ui()
         self._connect_signals()
+
+        # debounce timer for omnibox suggestions — prevents UI freeze on large histories
+        self.omnibox_timer = QTimer(self)
+        self.omnibox_timer.setInterval(220)
+        self.omnibox_timer.setSingleShot(True)
+        self.omnibox_timer.timeout.connect(self._populate_suggestions)
+        self._pending_omnibox_text = ""
 
         QTimer.singleShot(250, self._restore_session)
         self._apply_app_palette()
@@ -449,7 +455,7 @@ class SchnopdihWindow(QMainWindow):
         self.status.addPermanentWidget(self.status_label)
         self.status.addPermanentWidget(self.progress)
 
-        # panels
+        # panels simplified as lists (popups created on demand)
         self.bookmarks_panel = QListWidget()
         self.history_panel = QListWidget()
         self.downloads_panel = QListWidget()
@@ -492,6 +498,8 @@ class SchnopdihWindow(QMainWindow):
 
         self.urlbar.returnPressed.connect(self._on_omnibox_go)
         self.urlbar.textEdited.connect(self._on_omnibox_edit)
+        # keep a safe keypress override that calls the QLineEdit default behaviour
+        self._orig_urlbar_keypress = self.urlbar.keyPressEvent
         self.urlbar.keyPressEvent = self._urlbar_keypress_override
 
         try:
@@ -500,23 +508,14 @@ class SchnopdihWindow(QMainWindow):
             pass
 
         # hotkeys
-        sc1 = QShortcut(QKeySequence("Ctrl+T"), self)
-        sc1.activated.connect(lambda: self.add_tab(DEFAULT_HOMEPAGE, switch=True))
-        sc2 = QShortcut(QKeySequence("Ctrl+W"), self)
-        sc2.activated.connect(lambda: self._safe_call(lambda: self._close_tab(self.tabs.currentIndex())))
-        sc3 = QShortcut(QKeySequence("Ctrl+L"), self)
-        sc3.activated.connect(lambda: self._safe_call(lambda: self.urlbar.setFocus()))
-        sc4 = QShortcut(QKeySequence("F11"), self)
-        sc4.activated.connect(self._toggle_fullscreen)
-        sc5 = QShortcut(QKeySequence("Ctrl+Shift+T"), self)
-        sc5.activated.connect(self._reopen_closed_tab)
-        sc6 = QShortcut(QKeySequence("Ctrl+R"), self)
-        sc6.activated.connect(lambda: self._safe_call(lambda: self._current_view().reload()))
-        # tab cycling
-        sc7 = QShortcut(QKeySequence("Ctrl+Tab"), self)
-        sc7.activated.connect(self._next_tab)
-        sc8 = QShortcut(QKeySequence("Ctrl+Shift+Tab"), self)
-        sc8.activated.connect(self._prev_tab)
+        QShortcut(QKeySequence("Ctrl+T"), self, activated=lambda: self.add_tab(DEFAULT_HOMEPAGE, switch=True))
+        QShortcut(QKeySequence("Ctrl+W"), self, activated=lambda: self._safe_call(lambda: self._close_tab(self.tabs.currentIndex())))
+        QShortcut(QKeySequence("Ctrl+L"), self, activated=lambda: self._safe_call(lambda: self.urlbar.setFocus()))
+        QShortcut(QKeySequence("F11"), self, activated=self._toggle_fullscreen)
+        QShortcut(QKeySequence("Ctrl+Shift+T"), self, activated=self._reopen_closed_tab)
+        QShortcut(QKeySequence("Ctrl+R"), self, activated=lambda: self._safe_call(lambda: self._current_view().reload()))
+        QShortcut(QKeySequence("Ctrl+Tab"), self, activated=self._next_tab)
+        QShortcut(QKeySequence("Ctrl+Shift+Tab"), self, activated=self._prev_tab)
 
     def add_tab(self, url: str = DEFAULT_HOMEPAGE, switch: bool = False, private: bool = False):
         if private:
@@ -539,12 +538,10 @@ class SchnopdihWindow(QMainWindow):
         view.titleChanged.connect(lambda t, v=view: self._update_tab_title(v, t))
         view.urlChanged.connect(lambda u, v=view: self._update_urlbar(v, u))
         view.loadFinished.connect(lambda ok, v=view: self._on_load_finished(ok, v))
-        # progress
         try:
             view.loadProgress.connect(lambda p, v=view: self._on_load_progress(p, v))
         except Exception:
             pass
-        # initialize zoom and audio state
         view.setZoomFactor(1.0)
         try:
             view.page().setAudioMuted(False)
@@ -616,31 +613,48 @@ class SchnopdihWindow(QMainWindow):
             pass
 
     def _on_omnibox_edit(self, text: str):
-        text = text.strip()
-        if not text:
-            self.suggestion_list.hide()
-            return
-        # gather suggestions from bookmarks and history
-        bms = self.bookmarks.search(text, limit=6)
-        hs = self.history.search(text, limit=6)
-        items = []
-        for b in bms:
-            items.append((b.get('title'), b.get('url')))
-        for h in hs:
-            items.append((h.get('title'), h.get('url')))
-        if not items:
-            self.suggestion_list.hide()
-            return
-        self.suggestion_list.clear()
-        for title, url in items:
-            it = QListWidgetItem(f"{title} — {url}")
-            it.setData(Qt.UserRole, url)
-            self.suggestion_list.addItem(it)
-        # position the popup under the urlbar
-        pos = self.urlbar.mapToGlobal(self.urlbar.rect().bottomLeft())
-        self.suggestion_list.move(pos)
-        self.suggestion_list.resize(self.urlbar.width(), min(240, 24 * (len(items) + 1)))
-        self.suggestion_list.show()
+        # debounce updates to avoid UI lock when searching large history/bookmarks
+        text = (text or "").strip()
+        self._pending_omnibox_text = text
+        # restart timer
+        try:
+            self.omnibox_timer.start()
+        except Exception:
+            # fallback to immediate populate if timer fails
+            self._populate_suggestions()
+
+    def _populate_suggestions(self):
+        text = self._pending_omnibox_text
+        try:
+            if not text:
+                self.suggestion_list.hide()
+                return
+            # gather suggestions (small limits to keep things fast)
+            bms = self.bookmarks.search(text, limit=6)
+            hs = self.history.search(text, limit=6)
+            items = []
+            for b in bms:
+                items.append((b.get('title'), b.get('url')))
+            for h in hs:
+                items.append((h.get('title'), h.get('url')))
+            if not items:
+                self.suggestion_list.hide()
+                return
+            self.suggestion_list.clear()
+            for title, url in items:
+                it = QListWidgetItem(f"{title} — {url}")
+                it.setData(Qt.UserRole, url)
+                self.suggestion_list.addItem(it)
+            # position the popup under the urlbar
+            pos = self.urlbar.mapToGlobal(self.urlbar.rect().bottomLeft())
+            self.suggestion_list.move(pos)
+            self.suggestion_list.resize(self.urlbar.width(), min(240, 24 * (len(items) + 1)))
+            self.suggestion_list.show()
+        except Exception:
+            try:
+                self.suggestion_list.hide()
+            except Exception:
+                pass
 
     def _on_suggestion_clicked(self, item: QListWidgetItem):
         url = item.data(Qt.UserRole)
@@ -659,7 +673,7 @@ class SchnopdihWindow(QMainWindow):
             if not parsed.netloc:
                 return "http://" + text
             return text
-        return "https://duckduckgo.com/?q=" + text.replace(" ", "+")
+        return "https://www.google.com/search?q=" + text.replace(" ", "+")
 
     def _on_load_finished(self, ok: bool, view: SchnopdihWebView):
         try:
@@ -730,23 +744,23 @@ class SchnopdihWindow(QMainWindow):
 
     def _apply_app_palette(self):
         pal = QPalette()
-        pal.setColor(QPalette.Window, QColor(10, 14, 20))
+        pal.setColor(QPalette.Window, QColor(11, 20, 30))
         pal.setColor(QPalette.WindowText, QColor(230, 238, 248))
-        pal.setColor(QPalette.Base, QColor(6, 9, 15))
+        pal.setColor(QPalette.Base, QColor(12, 18, 26))
         pal.setColor(QPalette.Text, QColor(230, 238, 248))
         pal.setColor(QPalette.Button, QColor(20, 28, 38))
         pal.setColor(QPalette.ButtonText, QColor(230, 238, 248))
         QApplication.instance().setPalette(pal)
         self.setStyleSheet(
             """
-            QMainWindow{background:#061221}
-            QToolBar{background:#071226;border:none}
-            QLineEdit{background:#0f172a;border-radius:8px;padding:6px;color:#e6eef8}
-            QPushButton{background:#0f172a;border-radius:8px;padding:6px;color:#e6eef8}
-            QPushButton:hover{background:#1e293b}
+            QMainWindow{background:#0b1420}
+            QToolBar{background:#0f1b2a;border:none}
+            QLineEdit{background:#0e2536;border-radius:8px;padding:6px;color:#e6eef8}
+            QPushButton{background:#0e2536;border-radius:8px;padding:6px;color:#e6eef8}
+            QPushButton:hover{background:#163145}
             QTabBar::tab{padding:10px}
-            QTabBar::tab:selected{background:#1e293b;border-radius:10px}
-            QMenu{background:#071226;color:#e6eef8}
+            QTabBar::tab:selected{background:#163145;border-radius:10px}
+            QMenu{background:#0f1b2a;color:#e6eef8}
             """
         )
 
@@ -946,9 +960,18 @@ class SchnopdihWindow(QMainWindow):
             if modifiers & Qt.ControlModifier:
                 # ctrl+enter -> add http://www. and .com
                 self.urlbar.setText(f"http://www.{text}.com")
+            # ensure suggestions are hidden when leaving omnibox
+            try:
+                self.suggestion_list.hide()
+            except Exception:
+                pass
             self._on_omnibox_go()
             return
-        QLineEdit.keyPressEvent(self.urlbar, event)
+        # fall back to original key handler
+        try:
+            self._orig_urlbar_keypress(event)
+        except Exception:
+            QLineEdit.keyPressEvent(self.urlbar, event)
 
 # -------------------------
 # Attachments and launch
@@ -981,10 +1004,10 @@ def _quick_find(window: SchnopdihWindow):
 
 
 def _toggle_theme(window: SchnopdihWindow):
-    if window.current_theme_css == DARK_THEME_CSS:
+    if window.current_theme_css == SOFT_DARK_THEME_CSS:
         window.current_theme_css = LIGHT_THEME_CSS
     else:
-        window.current_theme_css = DARK_THEME_CSS
+        window.current_theme_css = SOFT_DARK_THEME_CSS
     # re-inject CSS into all tabs
     for i in range(window.tabs.count()):
         w = window.tabs.widget(i)
