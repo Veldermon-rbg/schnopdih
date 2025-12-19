@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-# schnopdih v6 — fixes: added missing _safe_call, persistent dialogs so Bookmarks/History/Downloads don't vanish,
-# plus small robustness tweaks. Light theme retained.
-# Save as schnopdih_v6.py and run: python schnopdih_v6.py
+# schnopdih v6 — fixes: modal dialog bugfix, bookmark button context menu, star toggle, and omnibox perf tweaks.
+# Save as schnopdih_v6_fixed.py and run: python schnopdih_v6_fixed.py
 
 import os
 import sys
@@ -170,6 +169,11 @@ class BookmarkManager:
         self.bookmarks: List[Dict] = _load_json(self.path, []) or []
 
     def add(self, title: str, url: str):
+        if not url:
+            return
+        if not urlparse(url).scheme:
+            if "." in url and " " not in url:
+                url = "http://" + url
         if any(b.get("url") == url for b in self.bookmarks):
             return
         entry = {"title": title or url, "url": url, "created": _now_iso()}
@@ -180,8 +184,22 @@ class BookmarkManager:
         self.bookmarks = [b for b in self.bookmarks if b.get("url") != url]
         _save_json(self.path, self.bookmarks)
 
+    def update(self, old_url: str, new_title: str, new_url: str):
+        for b in self.bookmarks:
+            if b.get("url") == old_url:
+                b["title"] = new_title or new_url
+                b["url"] = new_url
+                b["updated"] = _now_iso()
+                break
+        _save_json(self.path, self.bookmarks)
+
     def all(self) -> List[Dict]:
         return list(self.bookmarks)
+
+    def exists(self, url: str) -> bool:
+        if not url:
+            return False
+        return any(b.get("url") == url for b in self.bookmarks)
 
     def search(self, q: str, limit: int = 12) -> List[Dict]:
         ql = (q or "").lower()
@@ -213,7 +231,20 @@ class HistoryManager:
         ql = (q or "").lower()
         if not ql:
             return self.history[:limit]
-        res = [h for h in self.history if ql in (h.get("title") or "").lower() or ql in (h.get("url") or "")]
+        res = []
+        # scan in LIFO order but stop early for perf
+        scanned = 0
+        max_scan = 3000  # don't scan more than 3k entries for responsiveness
+        for h in self.history:
+            if scanned >= max_scan:
+                break
+            scanned += 1
+            t = (h.get("title") or "").lower()
+            u = (h.get("url") or "").lower()
+            if ql in t or ql in u:
+                res.append(h)
+                if len(res) >= limit:
+                    break
         return res[:limit]
 
 
@@ -328,7 +359,7 @@ class SchnopdihWebView(QWebEngineView):
 
     def inject_css(self, css: str):
         try:
-            safe_css = css.replace("`", "\\`")
+            safe_css = css.replace("`", "\`")
             js = ("(function(){var id='__schnopdih_css';var s=document.getElementById(id);if(!s){s=document.createElement('style');s.id=id;document.head.appendChild(s);}s.textContent = `" + safe_css + "`;})();")
             self.page().runJavaScript(js)
         except Exception:
@@ -448,6 +479,156 @@ class TitleBar(QWidget):
         self.title.setText(text)
 
 # -------------------------
+# Bookmarks Dialog (add/remove/edit)
+# -------------------------
+class BookmarksDialog(QDialog):
+    def __init__(self, parent_window):
+        super().__init__(parent_window)
+        self.parent_window = parent_window
+        self.setWindowTitle("Bookmarks")
+        self.resize(700, 420)
+        layout = QVBoxLayout(self)
+
+        # list
+        self.list = QListWidget(self)
+        self.list.setSelectionMode(QListWidget.SingleSelection)
+        layout.addWidget(self.list)
+
+        # buttons
+        btn_row = QHBoxLayout()
+        self.btn_open = QPushButton("Open", self)
+        self.btn_add = QPushButton("Add...", self)
+        self.btn_edit = QPushButton("Edit...", self)
+        self.btn_remove = QPushButton("Remove", self)
+        self.btn_close = QPushButton("Close", self)
+        btn_row.addWidget(self.btn_open)
+        btn_row.addWidget(self.btn_add)
+        btn_row.addWidget(self.btn_edit)
+        btn_row.addWidget(self.btn_remove)
+        btn_row.addStretch()
+        btn_row.addWidget(self.btn_close)
+        layout.addLayout(btn_row)
+
+        # connect
+        self.list.itemDoubleClicked.connect(self._open_selected)
+        self.btn_open.clicked.connect(self._open_selected)
+        self.btn_add.clicked.connect(self._add)
+        self.btn_edit.clicked.connect(self._edit_selected)
+        self.btn_remove.clicked.connect(self._remove_selected)
+        self.btn_close.clicked.connect(self.close)
+
+        # context menu
+        self.list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.list.customContextMenuRequested.connect(self._context_menu)
+
+        self._refresh()
+
+    def _context_menu(self, pos):
+        it = self.list.itemAt(pos)
+        menu = QMenu(self)
+        if it:
+            menu.addAction("Open", lambda: self._open_item(it))
+            menu.addAction("Edit", lambda: self._edit_item(it))
+            menu.addAction("Remove", lambda: self._remove_item(it))
+        menu.addAction("Add Bookmark", self._add)
+        menu.exec_(self.list.mapToGlobal(pos))
+
+    def _refresh(self):
+        self.list.clear()
+        for b in self.parent_window.bookmarks.all():
+            it = QListWidgetItem(f"{b.get('title')} — {b.get('url')}")
+            it.setData(Qt.UserRole, b.get('url'))
+            self.list.addItem(it)
+
+    def _open_item(self, it: QListWidgetItem):
+        url = it.data(Qt.UserRole)
+        if url:
+            self.parent_window.add_tab(url, switch=True)
+
+    def _open_selected(self):
+        it = self.list.currentItem()
+        if it:
+            self._open_item(it)
+
+    def _add(self):
+        # Note: don't _track_dialog here; it's modal — avoid WA_DeleteOnClose interfering
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Add Bookmark")
+        form = QFormLayout(dlg)
+        title_in = QLineEdit(dlg)
+        url_in = QLineEdit(dlg)
+        form.addRow("Title:", title_in)
+        form.addRow("URL:", url_in)
+        btn_row = QHBoxLayout()
+        ok = QPushButton("OK", dlg)
+        canc = QPushButton("Cancel", dlg)
+        btn_row.addStretch()
+        btn_row.addWidget(ok)
+        btn_row.addWidget(canc)
+        form.addRow(btn_row)
+        ok.clicked.connect(dlg.accept)
+        canc.clicked.connect(dlg.reject)
+        if dlg.exec_() == QDialog.Accepted:
+            t = title_in.text().strip()
+            u = url_in.text().strip()
+            if u:
+                self.parent_window.bookmarks.add(t, u)
+                show_toast(self.parent_window, "Bookmark added")
+                self._refresh()
+                self.parent_window.refresh_bookmarks_toolbar()
+
+    def _edit_item(self, it: QListWidgetItem):
+        old_url = it.data(Qt.UserRole)
+        text = it.text()
+        parts = text.split(" — ")
+        old_title = parts[0] if parts else ""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Edit Bookmark")
+        form = QFormLayout(dlg)
+        title_in = QLineEdit(dlg)
+        title_in.setText(old_title)
+        url_in = QLineEdit(dlg)
+        url_in.setText(old_url)
+        form.addRow("Title:", title_in)
+        form.addRow("URL:", url_in)
+        btn_row = QHBoxLayout()
+        ok = QPushButton("OK", dlg)
+        canc = QPushButton("Cancel", dlg)
+        btn_row.addStretch()
+        btn_row.addWidget(ok)
+        btn_row.addWidget(canc)
+        form.addRow(btn_row)
+        ok.clicked.connect(dlg.accept)
+        canc.clicked.connect(dlg.reject)
+        if dlg.exec_() == QDialog.Accepted:
+            new_title = title_in.text().strip()
+            new_url = url_in.text().strip()
+            if new_url:
+                self.parent_window.bookmarks.update(old_url, new_title, new_url)
+                show_toast(self.parent_window, "Bookmark updated")
+                self._refresh()
+                self.parent_window.refresh_bookmarks_toolbar()
+
+    def _edit_selected(self):
+        it = self.list.currentItem()
+        if it:
+            self._edit_item(it)
+
+    def _remove_item(self, it: QListWidgetItem):
+        url = it.data(Qt.UserRole)
+        if not url:
+            return
+        self.parent_window.bookmarks.remove(url)
+        show_toast(self.parent_window, "Bookmark removed")
+        self._refresh()
+        self.parent_window.refresh_bookmarks_toolbar()
+
+    def _remove_selected(self):
+        it = self.list.currentItem()
+        if it:
+            self._remove_item(it)
+
+# -------------------------
 # Main window
 # -------------------------
 class SchnopdihWindow(QMainWindow):
@@ -562,6 +743,14 @@ class SchnopdihWindow(QMainWindow):
         self.urlbar.setFixedHeight(34)
         self.toolbar.addWidget(self.urlbar)
 
+        # star button for bookmarking current page
+        self.star_btn = QPushButton("☆")
+        self.star_btn.setFixedHeight(28)
+        self.star_btn.setFixedWidth(32)
+        self.star_btn.setToolTip("Bookmark this page")
+        self.star_btn.clicked.connect(self._toggle_bookmark_current)
+        self.toolbar.addWidget(self.star_btn)
+
         self.btn_menu = QPushButton("≡")
         self.btn_menu.setFixedHeight(30)
         self.toolbar.addWidget(self.btn_menu)
@@ -626,6 +815,9 @@ class SchnopdihWindow(QMainWindow):
                 btn.setStyleSheet('background:#fff;border:1px solid #e6e6e6;padding:4px 8px;border-radius:6px;color:#000;')
                 btn.setFixedHeight(26)
                 btn.clicked.connect(lambda checked, url=b.get('url'): self.add_tab(url, switch=True))
+                # custom context menu on each button
+                btn.setContextMenuPolicy(Qt.CustomContextMenu)
+                btn.customContextMenuRequested.connect(lambda pos, url=b.get('url'), btn=btn: self._bookmark_button_context_menu(url, btn))
                 layout.addWidget(btn)
             # spacer and add current button
             spacer = QWidget()
@@ -638,6 +830,46 @@ class SchnopdihWindow(QMainWindow):
             layout.addWidget(add_btn)
         except Exception:
             pass
+
+    def _bookmark_button_context_menu(self, url: str, btn: QWidget):
+        menu = QMenu(self)
+        menu.addAction("Open", lambda: self.add_tab(url, switch=True))
+        menu.addAction("Edit", lambda: self._edit_bookmark_dialog(url))
+        menu.addAction("Remove", lambda: (self.bookmarks.remove(url), self.refresh_bookmarks_toolbar(), show_toast(self, "Bookmark removed")))
+        menu.exec_(btn.mapToGlobal(btn.rect().bottomLeft()))
+
+    def _edit_bookmark_dialog(self, old_url: str):
+        # find current title
+        title = ""
+        for b in self.bookmarks.all():
+            if b.get("url") == old_url:
+                title = b.get("title", "")
+                break
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Edit Bookmark")
+        form = QFormLayout(dlg)
+        title_in = QLineEdit(dlg)
+        title_in.setText(title)
+        url_in = QLineEdit(dlg)
+        url_in.setText(old_url)
+        form.addRow("Title:", title_in)
+        form.addRow("URL:", url_in)
+        btn_row = QHBoxLayout()
+        ok = QPushButton("OK", dlg)
+        canc = QPushButton("Cancel", dlg)
+        btn_row.addStretch()
+        btn_row.addWidget(ok)
+        btn_row.addWidget(canc)
+        form.addRow(btn_row)
+        ok.clicked.connect(dlg.accept)
+        canc.clicked.connect(dlg.reject)
+        if dlg.exec_() == QDialog.Accepted:
+            new_title = title_in.text().strip()
+            new_url = url_in.text().strip()
+            if new_url:
+                self.bookmarks.update(old_url, new_title, new_url)
+                show_toast(self, "Bookmark updated")
+                self.refresh_bookmarks_toolbar()
 
     def _connect_signals(self):
         self.act_back.triggered.connect(lambda: self._safe_call(lambda: self._current_view().back()))
@@ -674,7 +906,6 @@ class SchnopdihWindow(QMainWindow):
         menu.addAction("Bookmarks", lambda: self._show_bookmarks())
         menu.addAction("History", lambda: self._show_history())
         menu.addAction("Downloads", lambda: self._show_downloads())
-        # exec_ keeps it modal so it shouldn't disappear immediately
         menu.exec_(self.btn_menu.mapToGlobal(self.btn_menu.rect().bottomLeft()))
 
     def add_tab(self, url: str = DEFAULT_HOMEPAGE, switch: bool = False, private: bool = False):
@@ -709,6 +940,11 @@ class SchnopdihWindow(QMainWindow):
             pass
         view.setZoomFactor(1.0)
         view.loadFinished.connect(lambda ok, v=view: self._inject_extensions_into_view(v))
+        if url:
+            try:
+                view.load(QUrl(url))
+            except Exception:
+                pass
         return view
 
     def _current_view(self) -> Optional[SchnopdihWebView]:
@@ -718,18 +954,18 @@ class SchnopdihWindow(QMainWindow):
         return None
 
     def _on_view_url_changed(self, view: SchnopdihWebView, qurl: QUrl):
-        # intercept Chrome webstore and chrome:// pages — show help instead (QtWebEngine doesn't support these)
         try:
             url = qurl.toString()
             lower = url.lower()
             if 'chrome.google.com/webstore' in lower or lower.startswith('chrome://') or 'chrome://extensions' in lower:
                 help_html = self._chrome_webstore_help_html()
-                # load help HTML into the view (prevents the broken store from trying to run)
                 view.setHtml(help_html, QUrl('about:blank'))
                 show_toast(self, 'Chrome Web Store is not supported directly — opened help')
                 return
         except Exception:
             pass
+        # update star state on URL change
+        QTimer.singleShot(50, self._update_star_button)
 
     def _chrome_webstore_help_html(self):
         return """
@@ -764,6 +1000,8 @@ class SchnopdihWindow(QMainWindow):
                 self._update_urlbar(v, v.url())
             except Exception:
                 pass
+        # update star icon when switching tabs
+        QTimer.singleShot(30, self._update_star_button)
 
     def _close_tab(self, index: int):
         if index < 0 or index >= self.tabs.count():
@@ -812,6 +1050,8 @@ class SchnopdihWindow(QMainWindow):
         self.urlbar.blockSignals(True)
         self.urlbar.setText(qurl.toString())
         self.urlbar.blockSignals(False)
+        # update star after urlbar update
+        QTimer.singleShot(10, self._update_star_button)
 
     def _on_omnibox_go(self):
         text = self.urlbar.text().strip()
@@ -916,6 +1156,41 @@ class SchnopdihWindow(QMainWindow):
         self.bookmarks.add(title, url)
         show_toast(self, "Bookmark saved")
         self.refresh_bookmarks_toolbar()
+        self._update_star_button()
+
+    def _toggle_bookmark_current(self):
+        v = self._current_view()
+        if not v:
+            return
+        url = v.url().toString()
+        if not url:
+            return
+        if self.bookmarks.exists(url):
+            self.bookmarks.remove(url)
+            show_toast(self, "Bookmark removed")
+        else:
+            title = v.title() or url
+            self.bookmarks.add(title, url)
+            show_toast(self, "Bookmark added")
+        self.refresh_bookmarks_toolbar()
+        self._update_star_button()
+
+    def _update_star_button(self):
+        try:
+            v = self._current_view()
+            if not v:
+                self.star_btn.setText("☆")
+                self.star_btn.setToolTip("Bookmark this page")
+                return
+            url = v.url().toString()
+            if self.bookmarks.exists(url):
+                self.star_btn.setText("★")
+                self.star_btn.setToolTip("Remove bookmark")
+            else:
+                self.star_btn.setText("☆")
+                self.star_btn.setToolTip("Bookmark this page")
+        except Exception:
+            pass
 
     def _on_download_requested(self, item):
         try:
@@ -1012,16 +1287,9 @@ class SchnopdihWindow(QMainWindow):
 
     # UI dialogs
     def _show_bookmarks(self):
-        dlg = QListWidget()
-        dlg.setWindowTitle("Bookmarks")
-        for b in self.bookmarks.all():
-            it = QListWidgetItem(f"{b.get('title')} — {b.get('url')}")
-            it.setData(Qt.UserRole, b.get('url'))
-            dlg.addItem(it)
-        dlg.itemDoubleClicked.connect(lambda it: self.add_tab(it.data(Qt.UserRole), switch=True))
-        dlg.resize(600, 400)
-        dlg.show()
-        self._track_dialog(dlg)
+        dlg = BookmarksDialog(self)
+        # Bookmark dialog is modal so use exec_ (don't track it with WA_DeleteOnClose)
+        dlg.exec_()
 
     def _show_history(self):
         dlg = QListWidget()
