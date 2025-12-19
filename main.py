@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
-# schnopdih — single-file aesthetic Chromium browser (Windows 10/11 friendly)
-# Requires: PyQt5, PyQtWebEngine
-# Save as main.py and run: python main.py
+# schnopdih v2 — single-file aesthetic Chromium browser (Windows 10/11 friendly)
+# Feature-rich, more user-friendly, better error handling, working hotkeys, tab + button,
+# omnibox suggestions from bookmarks/history, reopen closed tabs, status/progress bar,
+# dark/light theme toggle, fullscreen (F11), focus omnibox (Ctrl+L), close tab (Ctrl+W),
+# reopen closed tab (Ctrl+Shift+T), cycle tabs Ctrl+Tab / Ctrl+Shift+Tab.
+# Save as schnopdih_v2.py and run: python schnopdih_v2.py
 
 import os
-# Prefer software rendering for WebEngine on some Windows GPUs to avoid flicker
-# and make the WebEngine process more stable on wide variety of machines.
-os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu --disable-gpu-compositing --disable-software-rasterizer")
-os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
-
 import sys
 import json
 import shutil
@@ -18,7 +16,10 @@ from datetime import datetime
 from urllib.parse import urlparse
 from typing import List, Dict, Optional
 
-# Import Qt after environment flags are set
+# Prefer software rendering for WebEngine on some Windows GPUs to avoid flicker
+os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu --disable-gpu-compositing --disable-software-rasterizer")
+os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
+
 from PyQt5.QtCore import (
     Qt,
     QUrl,
@@ -26,9 +27,9 @@ from PyQt5.QtCore import (
     QTimer,
     QPropertyAnimation,
     QEasingCurve,
-    QByteArray,
+    pyqtSignal,
 )
-from PyQt5.QtGui import QColor, QPalette, QKeySequence, QPixmap
+from PyQt5.QtGui import QColor, QPalette, QKeySequence, QIcon
 from PyQt5.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -48,6 +49,9 @@ from PyQt5.QtWidgets import (
     QStyle,
     QLabel,
     QSizePolicy,
+    QProgressBar,
+    QShortcut,
+    QInputDialog,
 )
 from PyQt5.QtWebEngineWidgets import (
     QWebEngineView,
@@ -77,7 +81,13 @@ STORAGE_DIR.mkdir(exist_ok=True)
 DEFAULT_HOMEPAGE = "https://duckduckgo.com/"
 DEFAULT_WINDOW_SIZE = (1280, 820)
 
-DEFAULT_THEME_CSS = """
+LIGHT_THEME_CSS = """
+body{background:#f6f8fb !important;color:#0b1b2b !important;font-family:-apple-system,Segoe UI,Roboto,Arial}
+a{color:#0b84ff !important}
+img{max-width:100%;border-radius:6px}
+"""
+
+DARK_THEME_CSS = """
 body{background:#061221 !important;color:#dfeaf6 !important;font-family:-apple-system,Segoe UI,Roboto,Arial}
 a{color:#7dd3fc !important}
 img{max-width:100%;border-radius:8px}
@@ -88,6 +98,7 @@ img{max-width:100%;border-radius:8px}
 # -------------------------
 # Persistence helpers
 # -------------------------
+
 def _load_json(path: Path, default):
     try:
         if path.exists():
@@ -109,9 +120,8 @@ def _save_json(path: Path, data):
 def _now_iso() -> str:
     return datetime.utcnow().isoformat() + "Z"
 
-
 # -------------------------
-# Managers: Bookmarks, History, Session, Downloads
+# Managers
 # -------------------------
 class BookmarkManager:
     def __init__(self, path: Path = BOOKMARKS_FILE):
@@ -196,10 +206,17 @@ class DownloadManager:
         dr = DownloadRecord(item, dest)
         self.active.append(dr)
         try:
+            # WebEngineDownloadItem API varies by version; best-effort wiring
             item.setPath(dest)
             item.accept()
-            item.finished.connect(lambda: self._finish(dr))
-            item.downloadProgress.connect(lambda received, total: self._progress(dr, received, total))
+            try:
+                item.finished.connect(lambda: self._finish(dr))
+            except Exception:
+                pass
+            try:
+                item.downloadProgress.connect(lambda received, total: self._progress(dr, received, total))
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -215,9 +232,8 @@ class DownloadManager:
     def cleanup_finished(self):
         self.active = [d for d in self.active if not d.finished]
 
-
 # -------------------------
-# Simple request interceptor (small tracker/ad blocker)
+# Request interceptor
 # -------------------------
 class SimpleRequestInterceptor(QWebEngineUrlRequestInterceptor):
     def __init__(self, blocklist: Optional[List[str]] = None):
@@ -235,7 +251,6 @@ class SimpleRequestInterceptor(QWebEngineUrlRequestInterceptor):
             "amazon-adsystem",
         ]
 
-    # Called by Qt to let us inspect or block requests
     def interceptRequest(self, info):
         try:
             url = info.requestUrl().toString().lower()
@@ -246,12 +261,13 @@ class SimpleRequestInterceptor(QWebEngineUrlRequestInterceptor):
         except Exception:
             pass
 
-
 # -------------------------
-# WebView with utilities
+# WebView
 # -------------------------
 class SchnopdihWebView(QWebEngineView):
-    def __init__(self, profile: Optional[QWebEngineProfile] = None, theme_css: str = DEFAULT_THEME_CSS):
+    titleChanged = pyqtSignal(str)
+
+    def __init__(self, profile: Optional[QWebEngineProfile] = None, theme_css: str = DARK_THEME_CSS):
         super().__init__()
         if profile is not None:
             try:
@@ -267,13 +283,13 @@ class SchnopdihWebView(QWebEngineView):
         except Exception:
             pass
         self._theme_css = theme_css
-        # inject theme CSS after slight delay to let page load
         if theme_css:
-            QTimer.singleShot(500, lambda: self.inject_css(theme_css))
+            QTimer.singleShot(300, lambda: self.inject_css(theme_css))
 
     def inject_css(self, css: str):
-        js = "(function(){var id='__schnopdih_css';var s=document.getElementById(id);if(!s){s=document.createElement('style');s.id=id;document.head.appendChild(s);}s.textContent = `%s`;})();" % css
         try:
+            safe_css = css.replace("`", "\\`")
+            js = ("(function(){var id='__schnopdih_css';var s=document.getElementById(id);if(!s){s=document.createElement('style');s.id=id;document.head.appendChild(s);}s.textContent = `" + safe_css + "`;})();")
             self.page().runJavaScript(js)
         except Exception:
             pass
@@ -292,14 +308,14 @@ class SchnopdihWebView(QWebEngineView):
         if not text:
             return
         try:
-            self.findText("")  # clear
+            self.findText("")
             self.findText(text, QWebEnginePage.FindFlags())
         except Exception:
             pass
 
     def take_screenshot(self, path: Path) -> bool:
         try:
-            pixmap: QPixmap = self.grab()
+            pixmap = self.grab()
             pixmap.save(str(path))
             return True
         except Exception:
@@ -307,117 +323,15 @@ class SchnopdihWebView(QWebEngineView):
 
     def print_to_pdf(self, path: Path, callback=None) -> bool:
         try:
-            # Some PyQt versions accept a callback, others return bytes — best-effort
             try:
                 self.page().printToPdf(str(path), callback=callback)
             except TypeError:
-                # older signature
                 self.page().printToPdf(str(path))
                 if callback:
                     callback(True)
             return True
         except Exception:
             return False
-
-
-# -------------------------
-# Panels: Bookmarks, History, Downloads, Reading List
-# -------------------------
-class SidePanel(QWidget):
-    def __init__(self, title: str = "panel"):
-        super().__init__()
-        self.setWindowTitle(title)
-        self.resize(520, 640)
-        layout = QVBoxLayout(self)
-        self.list = QListWidget(self)
-        layout.addWidget(self.list)
-        self.setLayout(layout)
-
-
-class BookmarksPanel(SidePanel):
-    def __init__(self, manager: BookmarkManager):
-        super().__init__("Bookmarks")
-        self.manager = manager
-        self.refresh()
-
-    def refresh(self):
-        self.list.clear()
-        for b in self.manager.all():
-            self.list.addItem(QListWidgetItem(f"{b.get('title')} — {b.get('url')}"))
-
-
-class HistoryPanel(SidePanel):
-    def __init__(self, manager: HistoryManager):
-        super().__init__("History")
-        self.manager = manager
-        self.refresh()
-
-    def refresh(self):
-        self.list.clear()
-        for h in self.manager.history[:1000]:
-            self.list.addItem(QListWidgetItem(f"{h.get('title')} — {h.get('url')}"))
-
-
-class DownloadsPanel(SidePanel):
-    def __init__(self, manager: DownloadManager):
-        super().__init__("Downloads")
-        self.manager = manager
-        self.timer = QTimer(self)
-        self.timer.setInterval(400)
-        self.timer.timeout.connect(self._refresh)
-        self.timer.start()
-        self._refresh()
-
-    def _refresh(self):
-        self.list.clear()
-        for dr in self.manager.active:
-            label = f"{Path(dr.dest).name} — {dr.progress}%{' (done)' if dr.finished else ''}"
-            self.list.addItem(QListWidgetItem(label))
-
-
-class ReadingListPanel(SidePanel):
-    def __init__(self, path: Path = DATA_DIR / "reading_list.json"):
-        super().__init__("Reading List")
-        self.path = path
-        self.items = _load_json(self.path, []) or []
-        self.refresh()
-
-    def add(self, title: str, url: str):
-        if any(i.get("url") == url for i in self.items):
-            return
-        entry = {"title": title or url, "url": url, "added": _now_iso()}
-        self.items.insert(0, entry)
-        _save_json(self.path, self.items)
-        self.refresh()
-
-    def remove(self, url: str):
-        self.items = [i for i in self.items if i.get("url") != url]
-        _save_json(self.path, self.items)
-        self.refresh()
-
-    def refresh(self):
-        self.list.clear()
-        for it in self.items:
-            self.list.addItem(QListWidgetItem(f"{it.get('title')} — {it.get('url')}"))
-
-
-# -------------------------
-# Helpers: omnibox, zoom, mute
-# -------------------------
-def _looks_like_url(text: str) -> bool:
-    return "." in text and " " not in text
-
-
-def _parse_omnibox(text: str) -> str:
-    parsed = urlparse(text)
-    if parsed.scheme:
-        return text
-    if "." in text and " " not in text:
-        if not parsed.netloc:
-            return "http://" + text
-        return text
-    return "https://duckduckgo.com/?q=" + text.replace(" ", "+")
-
 
 # -------------------------
 # Main window
@@ -433,85 +347,66 @@ class SchnopdihWindow(QMainWindow):
         self.history = HistoryManager()
         self.downloads = DownloadManager()
         self.session = SessionManager()
-        self.reading_list = ReadingListPanel()
+        self.closed_tabs_stack: List[str] = []
+        self.current_theme_css = DARK_THEME_CSS
 
-        # use default profile but configure safe cache/storage directories
+        # profile
         self.profile = QWebEngineProfile.defaultProfile()
         try:
-            # Only set safe, short absolute paths (avoid odd concatenation bugs)
             self.profile.setCachePath(str(CACHE_DIR))
             self.profile.setPersistentStoragePath(str(STORAGE_DIR))
             self.profile.setHttpCacheMaximumSize(300 * 1024 * 1024)
         except Exception:
             pass
 
-        # attach a small interceptor (best-effort, not required)
         try:
             interceptor = SimpleRequestInterceptor()
             try:
-                # PyQt5 supports setUrlRequestInterceptor
                 self.profile.setUrlRequestInterceptor(interceptor)
             except Exception:
-                # some versions may require different integration; ignore if fails
                 pass
         except Exception:
             pass
 
-        # build UI and wire signals
+        # UI
         self._build_ui()
         self._connect_signals()
 
-        # restore session after a slight delay (lets UI settle)
         QTimer.singleShot(250, self._restore_session)
-
-        # apply app palette/stylesheet to ensure visible chrome behind webview
         self._apply_app_palette()
-        self.setStyleSheet(
-            """
-            QMainWindow{background:#061221}
-            QToolBar{background:#071226;border:none}
-            QLineEdit{background:#0f172a;border-radius:8px;padding:6px;color:#e6eef8}
-            QPushButton{background:#0f172a;border-radius:8px;padding:6px;color:#e6eef8}
-            QPushButton:hover{background:#1e293b}
-            QTabBar::tab{padding:10px}
-            QTabBar::tab:selected{background:#1e293b;border-radius:10px}
-            """
-        )
 
-        # keep a persistent fade animation object to avoid GC issues that can cause weird opacity behavior
         self._fade_anim = QPropertyAnimation(self, b"windowOpacity")
-        self._fade_anim.setDuration(450)
+        self._fade_anim.setDuration(400)
         self._fade_anim.setStartValue(0.0)
         self._fade_anim.setEndValue(1.0)
         self._fade_anim.setEasingCurve(QEasingCurve.OutCubic)
-        # start visible immediately but animate reliably
         self.setWindowOpacity(0.0)
         self._fade_anim.start()
 
     def _build_ui(self):
-        # toolbar
         self.toolbar = QToolBar("Navigation")
         self.toolbar.setMovable(False)
         self.toolbar.setIconSize(QSize(18, 18))
         self.addToolBar(self.toolbar)
 
-        # actions
         self.act_back = QAction(self.style().standardIcon(QStyle.SP_ArrowBack), "Back", self)
         self.act_forward = QAction(self.style().standardIcon(QStyle.SP_ArrowForward), "Forward", self)
         self.act_reload = QAction(self.style().standardIcon(QStyle.SP_BrowserReload), "Reload", self)
         self.act_home = QAction("Home", self)
-        self.act_devtools = QAction("DevTools", self)
-        self.act_newtab = QAction("New Tab", self)
-        self.act_private_tab = QAction("New Private Tab", self)
-        self.act_save_session = QAction("Save Session", self)
         for a in (self.act_back, self.act_forward, self.act_reload, self.act_home):
             self.toolbar.addAction(a)
 
-        # omnibox
         self.urlbar = QLineEdit()
         self.urlbar.setPlaceholderText("Search or enter address...")
         self.urlbar.setFixedHeight(34)
         self.toolbar.addWidget(self.urlbar)
+
+        # quick suggestions popup for omnibox
+        self.suggestion_list = QListWidget()
+        self.suggestion_list.setWindowFlags(Qt.Popup)
+        self.suggestion_list.setFocusPolicy(Qt.NoFocus)
+        self.suggestion_list.setMouseTracking(True)
+        self.suggestion_list.itemClicked.connect(self._on_suggestion_clicked)
 
         # right side buttons
         self.btn_bookmark = QPushButton("★")
@@ -521,26 +416,22 @@ class SchnopdihWindow(QMainWindow):
         self.btn_duplicate = QPushButton("Duplicate Tab")
         self.btn_mute = QPushButton("Mute")
         self.btn_menu = QPushButton("≡")
-        right_buttons = [
-            self.btn_bookmark,
-            self.btn_reader,
-            self.btn_screenshot,
-            self.btn_pdf,
-            self.btn_duplicate,
-            self.btn_mute,
-            self.btn_menu,
-        ]
-        for b in right_buttons:
+        for b in (self.btn_bookmark, self.btn_reader, self.btn_screenshot, self.btn_pdf, self.btn_duplicate, self.btn_mute, self.btn_menu):
             b.setFixedHeight(30)
             b.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
             self.toolbar.addWidget(b)
 
-        # tabs
         self.tabs = QTabWidget()
         self.tabs.setDocumentMode(True)
         self.tabs.setTabsClosable(True)
         self.tabs.tabCloseRequested.connect(self._close_tab)
         self.tabs.currentChanged.connect(self._on_tab_changed)
+
+        # plus button in corner
+        self.btn_newtab_corner = QPushButton("+")
+        self.btn_newtab_corner.setFixedSize(26, 26)
+        self.btn_newtab_corner.clicked.connect(lambda: self.add_tab(DEFAULT_HOMEPAGE, switch=True))
+        self.tabs.setCornerWidget(self.btn_newtab_corner, corner=Qt.TopRightCorner)
 
         central = QWidget()
         central_layout = QVBoxLayout(central)
@@ -548,28 +439,41 @@ class SchnopdihWindow(QMainWindow):
         central_layout.addWidget(self.tabs)
         self.setCentralWidget(central)
 
+        # status bar
+        self.status = self.statusBar()
+        self.status_label = QLabel("Ready")
+        self.progress = QProgressBar()
+        self.progress.setMaximumWidth(180)
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.status.addPermanentWidget(self.status_label)
+        self.status.addPermanentWidget(self.progress)
+
         # panels
-        self.bookmarks_panel = BookmarksPanel(self.bookmarks)
-        self.history_panel = HistoryPanel(self.history)
-        self.downloads_panel = DownloadsPanel(self.downloads)
-        self.reading_list_panel = self.reading_list
+        self.bookmarks_panel = QListWidget()
+        self.history_panel = QListWidget()
+        self.downloads_panel = QListWidget()
 
         # menu
         self.menu = QMenu()
+        self.act_newtab = QAction("New Tab", self)
+        self.act_private_tab = QAction("New Private Tab", self)
+        self.act_save_session = QAction("Save Session", self)
+        self.act_devtools = QAction("DevTools", self)
         self.menu.addAction(self.act_newtab)
         self.menu.addAction(self.act_private_tab)
         self.menu.addAction(self.act_save_session)
-        self.menu.addAction("Bookmarks", lambda: self.bookmarks_panel.show())
-        self.menu.addAction("History", lambda: self.history_panel.show())
-        self.menu.addAction("Downloads", lambda: self.downloads_panel.show())
-        self.menu.addAction("Reading List", lambda: self.reading_list_panel.show())
+        self.menu.addSeparator()
+        self.menu.addAction("Bookmarks", lambda: self._show_bookmarks())
+        self.menu.addAction("History", lambda: self._show_history())
+        self.menu.addAction("Downloads", lambda: self._show_downloads())
+        self.menu.addAction("Reading List", lambda: self._show_reading_list())
         self.btn_menu.clicked.connect(lambda: self.menu.exec_(self.btn_menu.mapToGlobal(self.btn_menu.rect().bottomLeft())))
 
         # initial tab
         self.add_tab(DEFAULT_HOMEPAGE, switch=True)
 
     def _connect_signals(self):
-        # actions
         self.act_back.triggered.connect(lambda: self._safe_call(lambda: self._current_view().back()))
         self.act_forward.triggered.connect(lambda: self._safe_call(lambda: self._current_view().forward()))
         self.act_reload.triggered.connect(lambda: self._safe_call(lambda: self._current_view().reload()))
@@ -579,7 +483,6 @@ class SchnopdihWindow(QMainWindow):
         self.act_save_session.triggered.connect(self._save_session)
         self.act_devtools.triggered.connect(self._toggle_devtools)
 
-        # buttons
         self.btn_bookmark.clicked.connect(self._bookmark_current)
         self.btn_reader.clicked.connect(lambda: self._safe_call(lambda: self._current_view().enable_reader_mode()))
         self.btn_screenshot.clicked.connect(self._screenshot_current)
@@ -587,35 +490,39 @@ class SchnopdihWindow(QMainWindow):
         self.btn_duplicate.clicked.connect(self._duplicate_tab)
         self.btn_mute.clicked.connect(self._toggle_mute_current)
 
-        # omnibox
         self.urlbar.returnPressed.connect(self._on_omnibox_go)
+        self.urlbar.textEdited.connect(self._on_omnibox_edit)
+        self.urlbar.keyPressEvent = self._urlbar_keypress_override
 
-        # profile downloads (best-effort)
         try:
             self.profile.downloadRequested.connect(self._on_download_requested)
         except Exception:
             pass
 
-        # keyboard shortcuts
-        self.act_newtab.setShortcut(QKeySequence("Ctrl+T"))
-        self.act_save_session.setShortcut(QKeySequence("Ctrl+Shift+S"))
-        self.act_back.setShortcut(QKeySequence("Alt+Left"))
-        self.act_forward.setShortcut(QKeySequence("Alt+Right"))
+        # hotkeys
+        QShortcut(QKeySequence("Ctrl+T"), self, activated=lambda: self.add_tab(DEFAULT_HOMEPAGE, switch=True))
+        QShortcut(QKeySequence("Ctrl+W"), self, activated=lambda: self._safe_call(lambda: self._close_tab(self.tabs.currentIndex())))
+        QShortcut(QKeySequence("Ctrl+L"), self, activated=lambda: self._safe_call(lambda: self.urlbar.setFocus()))
+        QShortcut(QKeySequence("F11"), self, activated=self._toggle_fullscreen)
+        QShortcut(QKeySequence("Ctrl+Shift+T"), self, activated=self._reopen_closed_tab)
+        QShortcut(QKeySequence("Ctrl+R"), self, activated=lambda: self._safe_call(lambda: self._current_view().reload()))
+        # tab cycling
+        QShortcut(QKeySequence("Ctrl+Tab"), self, activated=self._next_tab)
+        QShortcut(QKeySequence("Ctrl+Shift+Tab"), self, activated=self._prev_tab)
 
     def add_tab(self, url: str = DEFAULT_HOMEPAGE, switch: bool = False, private: bool = False):
-        # private -> ephemeral profile with temp cache
         if private:
             profile = QWebEngineProfile()
             try:
                 profile.setPersistentCookiesPolicy(QWebEngineProfile.NoPersistentCookies)
                 tmp_cache = tempfile.mkdtemp(prefix="schnopdih_tmp_cache_")
                 profile.setCachePath(tmp_cache)
-                profile.setPersistentStoragePath("")  # avoid writing persistent storage
+                profile.setPersistentStoragePath("")
             except Exception:
                 pass
-            view = SchnopdihWebView(profile=profile, theme_css=DEFAULT_THEME_CSS)
+            view = SchnopdihWebView(profile=profile, theme_css=self.current_theme_css)
         else:
-            view = SchnopdihWebView(profile=self.profile, theme_css=DEFAULT_THEME_CSS)
+            view = SchnopdihWebView(profile=self.profile, theme_css=self.current_theme_css)
 
         idx = self.tabs.addTab(view, "New")
         if switch:
@@ -624,10 +531,14 @@ class SchnopdihWindow(QMainWindow):
         view.titleChanged.connect(lambda t, v=view: self._update_tab_title(v, t))
         view.urlChanged.connect(lambda u, v=view: self._update_urlbar(v, u))
         view.loadFinished.connect(lambda ok, v=view: self._on_load_finished(ok, v))
+        # progress
+        try:
+            view.loadProgress.connect(lambda p, v=view: self._on_load_progress(p, v))
+        except Exception:
+            pass
         # initialize zoom and audio state
         view.setZoomFactor(1.0)
         try:
-            # store muted property on page if supported later
             view.page().setAudioMuted(False)
         except Exception:
             pass
@@ -640,12 +551,20 @@ class SchnopdihWindow(QMainWindow):
         return None
 
     def _close_tab(self, index: int):
+        if index < 0 or index >= self.tabs.count():
+            return
         if self.tabs.count() <= 1:
             self.close()
             return
         widget = self.tabs.widget(index)
         try:
-            # If ephemeral profile used, attempt to cleanup its cache directory
+            url = widget.url().toString()
+            if url:
+                self.closed_tabs_stack.insert(0, url)
+                self.closed_tabs_stack = self.closed_tabs_stack[:20]
+        except Exception:
+            pass
+        try:
             page = widget.page()
             prof = page.profile() if page else None
             cache_path = None
@@ -673,7 +592,6 @@ class SchnopdihWindow(QMainWindow):
     def _update_urlbar(self, view: SchnopdihWebView, qurl: QUrl):
         if view != self._current_view():
             return
-        # ensure omnibox visible text; also keep window chrome visible by forcing palette
         self.urlbar.blockSignals(True)
         self.urlbar.setText(qurl.toString())
         self.urlbar.blockSignals(False)
@@ -682,18 +600,80 @@ class SchnopdihWindow(QMainWindow):
         text = self.urlbar.text().strip()
         if not text:
             return
-        url = _parse_omnibox(text)
+        url = self._parse_omnibox(text)
         try:
             self._current_view().load(QUrl(url))
+            self.suggestion_list.hide()
         except Exception:
             pass
 
-    def _on_load_finished(self, ok: bool, view: SchnopdihWebView):
-        if not ok:
+    def _on_omnibox_edit(self, text: str):
+        text = text.strip()
+        if not text:
+            self.suggestion_list.hide()
             return
-        title = view.title() or view.url().toString()
-        self.history.add(title, view.url().toString())
-        self._update_tab_title(view, title)
+        # gather suggestions from bookmarks and history
+        bms = self.bookmarks.search(text, limit=6)
+        hs = self.history.search(text, limit=6)
+        items = []
+        for b in bms:
+            items.append((b.get('title'), b.get('url')))
+        for h in hs:
+            items.append((h.get('title'), h.get('url')))
+        if not items:
+            self.suggestion_list.hide()
+            return
+        self.suggestion_list.clear()
+        for title, url in items:
+            it = QListWidgetItem(f"{title} — {url}")
+            it.setData(Qt.UserRole, url)
+            self.suggestion_list.addItem(it)
+        # position the popup under the urlbar
+        pos = self.urlbar.mapToGlobal(self.urlbar.rect().bottomLeft())
+        self.suggestion_list.move(pos)
+        self.suggestion_list.resize(self.urlbar.width(), min(240, 24 * (len(items) + 1)))
+        self.suggestion_list.show()
+
+    def _on_suggestion_clicked(self, item: QListWidgetItem):
+        url = item.data(Qt.UserRole)
+        if url:
+            try:
+                self._current_view().load(QUrl(url))
+            except Exception:
+                pass
+        self.suggestion_list.hide()
+
+    def _parse_omnibox(self, text: str) -> str:
+        parsed = urlparse(text)
+        if parsed.scheme:
+            return text
+        if "." in text and " " not in text:
+            if not parsed.netloc:
+                return "http://" + text
+            return text
+        return "https://duckduckgo.com/?q=" + text.replace(" ", "+")
+
+    def _on_load_finished(self, ok: bool, view: SchnopdihWebView):
+        try:
+            if not ok:
+                self.status_label.setText("Load failed")
+                return
+            title = view.title() or view.url().toString()
+            self.history.add(title, view.url().toString())
+            self._update_tab_title(view, title)
+            self.status_label.setText(title)
+            self.progress.setValue(100)
+            QTimer.singleShot(400, lambda: self.progress.setValue(0))
+        except Exception:
+            pass
+
+    def _on_load_progress(self, p: int, view: SchnopdihWebView):
+        try:
+            if view != self._current_view():
+                return
+            self.progress.setValue(p)
+        except Exception:
+            pass
 
     def _bookmark_current(self):
         v = self._current_view()
@@ -705,7 +685,10 @@ class SchnopdihWindow(QMainWindow):
         QMessageBox.information(self, "Bookmark", "Saved")
 
     def _on_download_requested(self, item):
-        suggested = str(Path(DOWNLOADS_DIR) / item.downloadFileName())
+        try:
+            suggested = str(Path(DOWNLOADS_DIR) / item.downloadFileName())
+        except Exception:
+            suggested = str(DOWNLOADS_DIR)
         path, _ = QFileDialog.getSaveFileName(self, "Save file as", suggested)
         if not path:
             try:
@@ -714,10 +697,11 @@ class SchnopdihWindow(QMainWindow):
                 pass
             return
         self.downloads.add(item, path)
+        QMessageBox.information(self, "Download", "Started")
 
     def _save_session(self):
         try:
-            tabs = [self.tabs.widget(i).url().toString() for i in range(self.tabs.count())]
+            tabs = [self.tabs.widget(i).url().toString() for i in range(self.tabs.count()) if self.tabs.widget(i)]
             self.session.save(tabs)
             QMessageBox.information(self, "Session", "Saved")
         except Exception:
@@ -745,10 +729,20 @@ class SchnopdihWindow(QMainWindow):
         pal.setColor(QPalette.Button, QColor(20, 28, 38))
         pal.setColor(QPalette.ButtonText, QColor(230, 238, 248))
         QApplication.instance().setPalette(pal)
+        self.setStyleSheet(
+            """
+            QMainWindow{background:#061221}
+            QToolBar{background:#071226;border:none}
+            QLineEdit{background:#0f172a;border-radius:8px;padding:6px;color:#e6eef8}
+            QPushButton{background:#0f172a;border-radius:8px;padding:6px;color:#e6eef8}
+            QPushButton:hover{background:#1e293b}
+            QTabBar::tab{padding:10px}
+            QTabBar::tab:selected{background:#1e293b;border-radius:10px}
+            QMenu{background:#071226;color:#e6eef8}
+            """
+        )
 
-    # -------------------------
-    # Extra features (stable)
-    # -------------------------
+    # Extra features
     def _toggle_devtools(self):
         v = self._current_view()
         if not v:
@@ -786,13 +780,11 @@ class SchnopdihWindow(QMainWindow):
         path, _ = QFileDialog.getSaveFileName(self, "Save page as PDF", str(DATA_DIR / "page.pdf"), "PDF files (*.pdf);;All files (*)")
         if not path:
             return
-
         def cb(result):
             try:
                 QMessageBox.information(self, "PDF", "Saved")
             except Exception:
                 pass
-
         ok = v.print_to_pdf(Path(path), callback=cb)
         if not ok:
             QMessageBox.warning(self, "PDF", "Failed to generate PDF")
@@ -810,10 +802,8 @@ class SchnopdihWindow(QMainWindow):
             return
         try:
             p = v.page()
-            # attempt to toggle audio muted if API available
             current = False
             try:
-                # PyQt exposes isAudioMuted in some versions; guard
                 current = p.isAudioMuted()
             except Exception:
                 try:
@@ -828,7 +818,6 @@ class SchnopdihWindow(QMainWindow):
                     setattr(p, "_schnopdih_muted", new)
                 except Exception:
                     pass
-            # update button text
             self.btn_mute.setText("Unmute" if new else "Mute")
         except Exception:
             pass
@@ -837,12 +826,17 @@ class SchnopdihWindow(QMainWindow):
         v = self._current_view()
         if not v:
             return
-        self.reading_list.add(v.title() or v.url().toString(), v.url().toString())
+        path = DATA_DIR / "reading_list.json"
+        items = _load_json(path, []) or []
+        url = v.url().toString()
+        title = v.title() or url
+        if any(i.get('url') == url for i in items):
+            QMessageBox.information(self, "Reading List", "Already in reading list")
+            return
+        items.insert(0, {"title": title, "url": url, "added": _now_iso()})
+        _save_json(path, items)
         QMessageBox.information(self, "Reading List", "Added")
 
-    # -------------------------
-    # Helpers
-    # -------------------------
     def _safe_call(self, fn):
         try:
             fn()
@@ -861,89 +855,136 @@ class SchnopdihWindow(QMainWindow):
             pass
         super().closeEvent(event)
 
+    # Quick dialogs / utilities
+    def _show_bookmarks(self):
+        dlg = QListWidget()
+        dlg.setWindowTitle("Bookmarks")
+        for b in self.bookmarks.all():
+            it = QListWidgetItem(f"{b.get('title')} — {b.get('url')}")
+            it.setData(Qt.UserRole, b.get('url'))
+            dlg.addItem(it)
+        dlg.itemDoubleClicked.connect(lambda it: self.add_tab(it.data(Qt.UserRole), switch=True))
+        dlg.resize(600, 400)
+        dlg.show()
+
+    def _show_history(self):
+        dlg = QListWidget()
+        dlg.setWindowTitle("History")
+        for h in self.history.history[:1000]:
+            it = QListWidgetItem(f"{h.get('title')} — {h.get('url')}")
+            it.setData(Qt.UserRole, h.get('url'))
+            dlg.addItem(it)
+        dlg.itemDoubleClicked.connect(lambda it: self.add_tab(it.data(Qt.UserRole), switch=True))
+        dlg.resize(700, 420)
+        dlg.show()
+
+    def _show_downloads(self):
+        dlg = QListWidget()
+        dlg.setWindowTitle("Downloads")
+        for dr in self.downloads.active:
+            label = f"{Path(dr.dest).name} — {dr.progress}%{' (done)' if dr.finished else ''}"
+            it = QListWidgetItem(label)
+            dlg.addItem(it)
+        dlg.resize(560, 300)
+        dlg.show()
+
+    def _show_reading_list(self):
+        path = DATA_DIR / "reading_list.json"
+        items = _load_json(path, []) or []
+        dlg = QListWidget()
+        dlg.setWindowTitle("Reading List")
+        for itn in items:
+            it = QListWidgetItem(f"{itn.get('title')} — {itn.get('url')}")
+            it.setData(Qt.UserRole, itn.get('url'))
+            dlg.addItem(it)
+        dlg.itemDoubleClicked.connect(lambda it: self.add_tab(it.data(Qt.UserRole), switch=True))
+        dlg.resize(640, 380)
+        dlg.show()
+
+    # other conveniences
+    def _toggle_fullscreen(self):
+        if self.isFullScreen():
+            self.showNormal()
+        else:
+            self.showFullScreen()
+
+    def _reopen_closed_tab(self):
+        if not self.closed_tabs_stack:
+            return
+        url = self.closed_tabs_stack.pop(0)
+        if url:
+            self.add_tab(url, switch=True)
+
+    def _next_tab(self):
+        idx = self.tabs.currentIndex()
+        cnt = self.tabs.count()
+        if cnt <= 1:
+            return
+        self.tabs.setCurrentIndex((idx + 1) % cnt)
+
+    def _prev_tab(self):
+        idx = self.tabs.currentIndex()
+        cnt = self.tabs.count()
+        if cnt <= 1:
+            return
+        self.tabs.setCurrentIndex((idx - 1) % cnt)
+
+    # override key handling for urlbar (so Ctrl+Enter / Alt+Enter behave)
+    def _urlbar_keypress_override(self, event):
+        key = event.key()
+        modifiers = QApplication.keyboardModifiers()
+        text = self.urlbar.text()
+        if key == Qt.Key_Return or key == Qt.Key_Enter:
+            if modifiers & Qt.ControlModifier:
+                # ctrl+enter -> add http://www. and .com
+                self.urlbar.setText(f"http://www.{text}.com")
+            self._on_omnibox_go()
+            return
+        QLineEdit.keyPressEvent(self.urlbar, event)
 
 # -------------------------
-# Small dialogs & quick actions
-# -------------------------
-class QuickFindDialog(QWidget):
-    def __init__(self, parent: SchnopdihWindow):
-        super().__init__(parent, Qt.Window)
-        self.setWindowTitle("Find on Page")
-        self.resize(420, 90)
-        layout = QHBoxLayout(self)
-        self.input = QLineEdit(self)
-        self.input.setPlaceholderText("Find on page...")
-        self.btn_close = QPushButton("Close", self)
-        layout.addWidget(self.input)
-        layout.addWidget(self.btn_close)
-        self.setLayout(layout)
-        self.input.returnPressed.connect(self._do_find)
-        self.btn_close.clicked.connect(self.close)
-        self.parent_window = parent
-
-    def _do_find(self):
-        text = self.input.text().strip()
-        v = self.parent_window._current_view()
-        if v:
-            v.find_text(text)
-
-
-class PreferencesDialog(QWidget):
-    def __init__(self, window: SchnopdihWindow):
-        super().__init__(window, Qt.Window)
-        self.setWindowTitle("Preferences")
-        self.resize(560, 360)
-        layout = QVBoxLayout(self)
-        self.window = window
-        self.btn_clear_cache = QPushButton("Clear Cache", self)
-        self.btn_open_reading = QPushButton("Open Reading List", self)
-        layout.addWidget(self.btn_clear_cache)
-        layout.addWidget(self.btn_open_reading)
-        self.btn_clear_cache.clicked.connect(self._clear_cache)
-        self.btn_open_reading.clicked.connect(lambda: self.window.reading_list.show())
-        self.setLayout(layout)
-
-    def _clear_cache(self):
-        try:
-            if CACHE_DIR.exists():
-                shutil.rmtree(str(CACHE_DIR), ignore_errors=True)
-            if STORAGE_DIR.exists():
-                shutil.rmtree(str(STORAGE_DIR), ignore_errors=True)
-            QMessageBox.information(self, "Cache", "Cleared")
-        except Exception:
-            QMessageBox.warning(self, "Cache", "Failed to clear cache")
-
-
-class AboutDialog(QWidget):
-    def __init__(self):
-        super().__init__(None, Qt.Window)
-        self.setWindowTitle("About schnopdih")
-        self.resize(480, 240)
-        layout = QVBoxLayout(self)
-        label = QLabel("schnopdih — aesthetic Chromium browser\nWindows 10/11 friendly", self)
-        label.setWordWrap(True)
-        layout.addWidget(label)
-        self.setLayout(layout)
-
-
-# -------------------------
-# UI attachment & launch
+# Attachments and launch
 # -------------------------
 def attach_quick_actions(window: SchnopdihWindow):
     about_act = QAction("About", window)
-    about_act.triggered.connect(lambda: AboutDialog().show())
-    prefs_dialog = PreferencesDialog(window)
+    about_act.triggered.connect(lambda: QMessageBox.information(window, "About schnopdih", "schnopdih v2 — aesthetic Chromium browser\nFeature rich single-file app"))
+    prefs_dialog = lambda: QMessageBox.information(window, "Preferences", "Preferences are intentionally minimal in this single-file build. Use the data dir: %s" % DATA_DIR)
     prefs_act = QAction("Preferences", window)
-    prefs_act.triggered.connect(lambda: prefs_dialog.show())
-    find_dialog = QuickFindDialog(window)
+    prefs_act.triggered.connect(prefs_dialog)
     find_act = QAction("Find on Page", window)
-    find_act.triggered.connect(lambda: find_dialog.show())
+    find_act.triggered.connect(lambda: _quick_find(window))
     reading_add_act = QAction("Add to Reading List", window)
     reading_add_act.triggered.connect(lambda: window.add_current_to_reading_list())
+    theme_toggle = QAction("Toggle Theme", window)
+    theme_toggle.triggered.connect(lambda: _toggle_theme(window))
     window.menu.addAction(about_act)
     window.menu.addAction(prefs_act)
     window.menu.addAction(find_act)
     window.menu.addAction(reading_add_act)
+    window.menu.addAction(theme_toggle)
+
+
+def _quick_find(window: SchnopdihWindow):
+    text, ok = QInputDialog.getText(window, "Find on Page", "Find:")
+    if ok and text:
+        v = window._current_view()
+        if v:
+            v.find_text(text)
+
+
+def _toggle_theme(window: SchnopdihWindow):
+    if window.current_theme_css == DARK_THEME_CSS:
+        window.current_theme_css = LIGHT_THEME_CSS
+    else:
+        window.current_theme_css = DARK_THEME_CSS
+    # re-inject CSS into all tabs
+    for i in range(window.tabs.count()):
+        w = window.tabs.widget(i)
+        try:
+            if isinstance(w, SchnopdihWebView):
+                w.inject_css(window.current_theme_css)
+        except Exception:
+            pass
 
 
 def main():
@@ -953,13 +994,10 @@ def main():
     window = SchnopdihWindow()
     attach_quick_actions(window)
 
-    # Show and raise window explicitly; on Windows, calling raise_ and activateWindow
-    # after show helps prevent the window being hidden behind other windows.
     window.show()
     window.raise_()
     window.activateWindow()
 
-    # ensure profile cache/storage are set once more (best-effort)
     try:
         prof = QWebEngineProfile.defaultProfile()
         prof.setCachePath(str(CACHE_DIR))
